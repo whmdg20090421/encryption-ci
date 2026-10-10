@@ -1,0 +1,493 @@
+name: Build APK & Plugins
+
+# 公共 CI 仓工作流：源码存放于私有仓，本仓仅承载编译。
+# 触发方式：仅手动（workflow_dispatch，由本地 push_build_download.sh 调用）。
+#
+#   1) detect 作业在【私有源码仓】工作树中检查 plugins/** 是否相对上一提交有变更
+#   2) 有变更 -> 编译 DEX（如该插件含 dex/src）并打包，发布到本仓 plugins 分支
+#   3) 无变更 -> 跳过插件流程
+#   4) 主 APK 编译始终执行
+#
+# 插件目录布局：
+#   plugins/<id>/plugin.json       源码清单（版本以此为准）
+#   plugins/<id>/web/              Web 形态
+#   plugins/<id>/dex/src/          DEX 形态源码
+# 产物布局（plugins 分支根）：
+#   plugins-dist/index.json        仓库索引（App 拉取）
+#   plugins-dist/<id>/<id>-ver.zip 最新版 + old/ 旧版本
+on:
+  workflow_dispatch:
+    inputs:
+      compact:
+        description: '启用 R8 代码缩减（压缩编译）'
+        required: false
+        default: 'true'
+        type: boolean
+      build_plugins:
+        description: '强制打包全部插件（忽略变更检测）'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  # ───────────────────────── 变更检测 ─────────────────────────
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      plugins_changed: ${{ steps.check.outputs.plugins_changed }}
+      apk_changed: ${{ steps.check.outputs.apk_changed }}
+      dexdirs: ${{ steps.check.outputs.dexdirs }}
+      dirs: ${{ steps.check.outputs.dirs }}
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: whmdg20090421/encryption
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - name: Detect plugin changes
+        id: check
+        run: |
+          set -e
+          FORCE="${{ inputs.build_plugins }}"
+          ALLDIRS=$(find plugins -mindepth 1 -maxdepth 1 -type d -not -name '__pycache__' 2>/dev/null || true)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+            DIRS="$ALLDIRS"
+          else
+            # 源码仓已 checkout 到当前工作树；用其最新提交相对父提交判定变更。
+            if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
+              CHANGED=$(git diff --name-only HEAD~1 HEAD || true)
+            else
+              CHANGED=$(git show --name-only --pretty=format: HEAD || true)
+            fi
+            DIRS=$(echo "$CHANGED" | grep '^plugins/' | cut -d/ -f1-2 | sort -u || true)
+            # 打包/编译脚本变更 -> 全量
+            if echo "$CHANGED" | grep -qE '^plugins/(pack_plugin.py|build_dex.sh)'; then
+              DIRS="$ALLDIRS"
+            fi
+            # XLSX 引擎本地源码变更 -> 重编文档插件
+            if echo "$CHANGED" | grep -qE '^tools/vendor/ooxml-excel-editor/'; then
+              DIRS="$DIRS plugins/document"
+            fi
+          fi
+          # 只保留含 plugin.json 的目录
+          FILTERED=""
+          for d in $DIRS; do
+            [ -f "$d/plugin.json" ] && FILTERED="$FILTERED $d"
+          done
+          # 其中 dex/src 内确有源码的插件才需要编译 DEX
+          DEXDIRS=""
+          for d in $FILTERED; do
+            if [ -n "$(find "$d/dex/src" \( -name '*.kt' -o -name '*.java' \) 2>/dev/null)" ]; then
+              DEXDIRS="$DEXDIRS $d"
+            fi
+          done
+          echo "dirs=$FILTERED" >> "$GITHUB_OUTPUT"
+          echo "dexdirs=$DEXDIRS" >> "$GITHUB_OUTPUT"
+          if [ -n "$FILTERED" ]; then
+            echo "plugins_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "plugins_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          # APK 侧是否变更：除 plugins/** 之外的文件有任何改动即需重编 APK。
+          # 手动触发时始终编译。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "apk_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            APK_CHANGED=$(echo "$CHANGED" | grep -vE '^plugins/' | grep -vE '^tools/vendor/' | grep -vE '^$' | head -1 || true)
+            if [ -n "$APK_CHANGED" ]; then
+              echo "apk_changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "apk_changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "待打包: $FILTERED"
+          echo "待编译 DEX: $DEXDIRS"
+
+  # ───────────────────────── 插件打包 ─────────────────────────
+  plugins:
+    needs: detect
+    if: needs.detect.outputs.plugins_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: whmdg20090421/encryption
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - name: Point origin at this CI repo (for publishing)
+        run: |
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install cryptography (签名用)
+        run: pip install cryptography
+
+      - name: Install Kotlin compiler (仅 DEX 插件需要)
+        if: needs.detect.outputs.dexdirs != ''
+        run: |
+          curl -sSL -o /tmp/kotlin.zip \
+            https://github.com/JetBrains/kotlin/releases/download/v2.2.10/kotlin-compiler-2.2.10.zip
+          unzip -q /tmp/kotlin.zip -d /opt
+          echo "/opt/kotlinc/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare signing key
+        id: signing
+        env:
+          PLUGIN_SIGNING_KEY: ${{ secrets.PLUGIN_SIGNING_KEY }}
+        run: |
+          if [ -n "$PLUGIN_SIGNING_KEY" ]; then
+            printf '%s' "$PLUGIN_SIGNING_KEY" > /tmp/plugin-sign.pem
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "已加载插件签名私钥"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 PLUGIN_SIGNING_KEY，跳过签名（仅 sha256 校验）"
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore existing plugins-dist (保留索引与历史产物)
+        run: |
+          set -e
+          mkdir -p plugins-dist
+          if git ls-remote --exit-code --heads origin plugins >/dev/null 2>&1; then
+            git fetch --depth=1 origin plugins
+            # 把 plugins 分支根的内容取到本地 plugins-dist，供打包脚本读取/更新索引
+            git archive FETCH_HEAD | tar -x -C plugins-dist || true
+            echo "已恢复 plugins 分支的既有产物："
+            ls -la plugins-dist || true
+          else
+            echo "plugins 分支尚不存在，首次发布"
+          fi
+
+      - name: Build vendored XLSX engine (ooxml-excel-editor)
+        if: contains(needs.detect.outputs.dirs, 'plugins/document')
+        run: |
+          bash tools/vendor/ooxml-excel-editor/build.sh
+
+      - name: Build DEX plugins
+        if: needs.detect.outputs.dexdirs != ''
+        run: |
+          for d in ${{ needs.detect.outputs.dexdirs }}; do
+            name=$(basename "$d")
+            echo "=== 编译 DEX 插件: $name ==="
+            plugins/build_dex.sh "$name"
+          done
+
+      - name: Pack plugins
+        run: |
+          set -e
+          SIGN_FLAG=""
+          if [ "${{ steps.signing.outputs.enabled }}" = "true" ]; then
+            SIGN_FLAG="--sign /tmp/plugin-sign.pem"
+          fi
+          mkdir -p plugins-dist
+          for d in ${{ needs.detect.outputs.dirs }}; do
+            name=$(basename "$d")
+            echo "=== 打包 $name ==="
+            python3 plugins/pack_plugin.py "$name" --out plugins-dist $SIGN_FLAG
+          done
+          echo "--- plugins-dist ---"
+          ls -la plugins-dist
+
+      - name: Publish to plugins branch
+        run: |
+          set -e
+          WORKSPACE="$PWD"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TMP=$(mktemp -d)
+          if git ls-remote --exit-code --heads origin plugins >/dev/null 2>&1; then
+            # 已有 plugins 分支：基于远端建本地跟踪分支后 checkout，保留历史产物
+            git fetch --depth=1 origin plugins
+            git worktree add -B plugins "$TMP" FETCH_HEAD
+          else
+            # 首次：建一个空孤儿分支
+            git worktree add --detach "$TMP" HEAD
+            cd "$TMP"
+            git checkout --orphan plugins
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          cd "$TMP"
+          # 产物布局：根放 index.json，各插件一个目录（最新 zip + old/ 历史）
+          cp -f "$WORKSPACE"/plugins-dist/index.json "$TMP"/ 2>/dev/null || true
+          # 用 -r 覆盖整个插件目录（保留其他插件的既有产物）
+          for pd in "$WORKSPACE"/plugins-dist/*/; do
+            [ -d "$pd" ] || continue
+            name=$(basename "$pd")
+            rm -rf "$TMP/$name"
+            cp -r "$pd" "$TMP/$name"
+          done
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "chore(plugins): 更新插件产物 $(date +%Y%m%d-%H%M)"
+            git push origin plugins
+          fi
+
+      - name: Upload plugin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins-dist
+          path: plugins-dist/**
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ───────────────────────── 主 APK 编译 ─────────────────────────
+  # 仅当 APK 侧（非 plugins/**）有变更时编译；纯插件变更跳过。手动触发时始终编译。
+  build:
+    needs: detect
+    if: needs.detect.outputs.apk_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: whmdg20090421/encryption
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          fetch-depth: 1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: false
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Code check (brace balance + unused imports)
+        run: |
+          echo "=== 代码检查 ==="
+          # 获取上次提交修改的 .kt 文件
+          FILES=$(git diff --name-only HEAD~1 -- '*.kt' 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            echo "没有修改的 .kt 文件，跳过检查"
+            exit 0
+          fi
+
+          ERROR=0
+
+          for file in $FILES; do
+            [ -f "$file" ] || continue
+            echo "--- 检查: $file ---"
+
+            # 1. 大括号平衡检测
+            OPEN=$(grep -o '{' "$file" | wc -l)
+            CLOSE=$(grep -o '}' "$file" | wc -l)
+            if [ "$OPEN" -ne "$CLOSE" ]; then
+              echo "FAIL: $file 大括号不平衡 {=$OPEN }=$CLOSE"
+              ERROR=1
+            else
+              echo "OK: $file 大括号平衡 {=$OPEN }=$CLOSE"
+            fi
+
+            # 2. 未使用 import 检测
+            while IFS= read -r line; do
+              # 跳过 wildcard import (import xxx.*)
+              echo "$line" | grep -q '\.\*$' && continue
+              # 提取 import 路径
+              imp=$(echo "$line" | sed 's/^import //' | sed 's/`//g')
+              # 获取最后一个标识符（处理 Kotlin as 别名）
+              name=$(echo "$imp" | awk -F'.' '{print $NF}')
+              if echo "$name" | grep -q ' as '; then
+                name=$(echo "$name" | sed 's/.* as //')
+              fi
+              [ -z "$name" ] && continue
+              # 在文件中搜索（排除 import 行和 package 行）
+              if ! grep -v '^import ' "$file" | grep -v '^package ' | grep -q "$name"; then
+                echo "WARN: $file 未使用 import: $line"
+              fi
+            done < <(grep '^import ' "$file")
+          done
+
+          if [ "$ERROR" -eq 1 ]; then
+            echo "::error::代码检查失败，请查看上方 FAIL 行"
+            exit 1
+          fi
+          echo "=== 检查通过 ==="
+
+      - name: Check unused Gradle dependencies
+        run: |
+          echo "=== 未使用 Gradle 依赖检查 ==="
+          WARN_COUNT=0
+
+          # 依赖坐标 → import 包名 映射
+          # 格式: "group:artifact" → "import.package.prefix"
+          declare -A DEP_MAP
+          DEP_MAP["androidx.compose.material:material-icons-extended"]="androidx.compose.material.icons"
+          DEP_MAP["org.bouncycastle:bcprov-jdk18on"]="org.bouncycastle"
+          DEP_MAP["com.squareup.okhttp3:okhttp"]="okhttp3"
+          DEP_MAP["com.thegrizzlylabs:sardine-android"]="com.thegrizzlylabs.sardine"
+          DEP_MAP["io.github.sunrise4ever:shizuku-api"]="rikka.shizuku"
+          DEP_MAP["io.github.sunrise4ever:shizuku-provider"]="rikka.shizuku"
+          DEP_MAP["com.jaredrummler:colorpicker"]="com.jaredrummler.colorpicker"
+          DEP_MAP["me.zhanghai.android.fastscroll"]="me.zhanghai.android.fastscroll"
+
+          for bfile in $(find . -name "build.gradle.kts" -not -path "*/build/*"); do
+            MODULE_DIR=$(dirname "$bfile")
+            # 跳过没有 src 目录的模块
+            [ -d "$MODULE_DIR/src" ] || continue
+
+            while IFS= read -r dep; do
+              # 提取 group:artifact（去掉版本号和引号）
+              ga=$(echo "$dep" | sed 's/.*implementation("//' | sed 's/").*//' | sed 's/:[^:]*$//' | sed 's/:[0-9][0-9.]*//')
+              # 只检查硬编码依赖（libs. 由版本目录管理，跳过）
+              echo "$dep" | grep -q 'libs\.' && continue
+
+              pkg="${DEP_MAP[$ga]}"
+              [ -z "$pkg" ] && continue
+
+              # 检查模块内是否有 Kotlin 文件 import 了该包
+              found=$(grep -rl "import ${pkg}" "$MODULE_DIR/src" --include="*.kt" 2>/dev/null | head -1)
+              if [ -z "$found" ]; then
+                echo "::warning file=$bfile::依赖 $ga 可能未被使用（未找到 import ${pkg}*）"
+                WARN_COUNT=$((WARN_COUNT + 1))
+              fi
+            done < <(grep 'implementation("' "$bfile" | grep -v '//.*implementation')
+          done
+
+          if [ "$WARN_COUNT" -eq 0 ]; then
+            echo "未发现未使用的硬编码依赖"
+          else
+            echo "::warning::共发现 $WARN_COUNT 个可能未使用的依赖，请检查上方 warning"
+          fi
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-argon2-cffi-v1
+          restore-keys: pip-argon2-cffi-
+
+      - name: Generate NDK auth files
+        env:
+          AUTH_K1_PASSWORD: ${{ secrets.AUTH_K1_PASSWORD }}
+        run: |
+          if [ -z "$AUTH_K1_PASSWORD" ]; then
+            echo "::error::Secret AUTH_K1_PASSWORD is empty."
+            exit 1
+          fi
+          pip install argon2-cffi
+          python3 tools/gen_password_hashes.py
+
+      - name: Decode Release Keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Secret KEYSTORE_B64 is empty."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > APP/app/release-keystore.jks
+          ls -la APP/app/release-keystore.jks
+          file APP/app/release-keystore.jks || true
+
+      - name: Build Release APK (arm64-v8a only)
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS:         ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:      ${{ secrets.KEY_PASSWORD }}
+          GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx4g
+        run: |
+          COMPACT_FLAG=""
+          if [ "${{ inputs.compact }}" != "false" ]; then
+            COMPACT_FLAG="-Pcompact=true"
+            echo "压缩编译模式：R8 代码缩减已启用"
+          else
+            echo "普通编译模式：R8 仅裁剪资源"
+          fi
+          ./gradlew :APP:app:assembleRelease --build-cache $COMPACT_FLAG -q > /tmp/build.log 2>&1 || {
+            echo "::error::编译失败，以下是错误日志："
+            tail -80 /tmp/build.log
+            exit 1
+          }
+          echo "编译成功"
+
+      - name: Locate APK
+        id: locate
+        run: |
+          APK=$(find APP/app/build/outputs/apk/release -name '*arm64-v8a*release*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::warning::Did not find ABI-tagged file. Falling back to any release apk."
+            APK=$(find APP/app/build/outputs/apk/release -name '*release*.apk' | head -n 1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced!"
+            ls -la APP/app/build/outputs/apk/release || true
+            exit 1
+          fi
+          echo "Apk path: $APK"
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK signature
+        run: |
+          BUILD_TOOLS_DIR=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n 1)
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_DIR/apksigner"
+          echo "Using apksigner: $APKSIGNER"
+          "$APKSIGNER" verify --verbose --print-certs "${{ steps.locate.outputs.apk_path }}" || true
+
+      - name: Rename APK with dynamic version
+        id: rename
+        run: |
+          ORIGINAL="${{ steps.locate.outputs.apk_path }}"
+          DIR=$(dirname "$ORIGINAL")
+
+          # Extract versionName directly from the APK manifest
+          BUILD_TOOLS_DIR=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n 1)
+          AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS_DIR/aapt2"
+          FULL_VERSION=$("$AAPT2" dump badging "$ORIGINAL" 2>/dev/null \
+            | grep -o "versionName='[^']*'" | cut -d"'" -f2)
+
+          if [ -z "$FULL_VERSION" ]; then
+            echo "::warning::Could not extract versionName, falling back to 'unknown'"
+            FULL_VERSION="unknown"
+          fi
+
+          # Take only the major.minor part (e.g. "1.3.12345" → "1.3")
+          VERSION_MAJOR_MINOR=$(echo "$FULL_VERSION" | cut -d. -f1-2)
+
+          TIMESTAMP=$(date +"%Y%m%d-%H%M")
+          NEW_NAME="工具箱-v${VERSION_MAJOR_MINOR}-${TIMESTAMP}-arm64-v8a-release.apk"
+          cp "$ORIGINAL" "${DIR}/${NEW_NAME}"
+          echo "apk_path=${DIR}/${NEW_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION_MAJOR_MINOR} (full: ${FULL_VERSION})"
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 工具箱-arm64-v8a-release
+          path: ${{ steps.rename.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 30
