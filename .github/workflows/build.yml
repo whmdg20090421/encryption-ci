@@ -1,4 +1,5 @@
 name: Build APK & Plugins
+run-name: "build ${{ inputs.source_sha || github.sha }}"
 
 # 公共 CI 仓工作流：源码存放于私有仓，本仓仅承载编译。
 # 触发方式：仅手动（workflow_dispatch，由本地 push_build_download.sh 调用）。
@@ -18,6 +19,11 @@ name: Build APK & Plugins
 on:
   workflow_dispatch:
     inputs:
+      source_sha:
+        description: '私有源码仓的目标提交（用于运行命名与去重）'
+        required: false
+        default: ''
+        type: string
       compact:
         description: '启用 R8 代码缩减（压缩编译）'
         required: false
