@@ -2,19 +2,22 @@
   "schemaVersion": 1,
   "plugins": [
     {
-      "id": "epub",
-      "name": "EPUB 阅读器",
-      "version": "1.0.0",
+      "id": "document",
+      "name": "文档",
+      "version": "1.4.0",
       "author": "whmdg",
-      "description": "EPUB 电子书阅读（翻页 / 目录 / 进度）。",
-      "type": "web",
-      "file": "epub/epub-1.0.0.zip",
-      "updatedAt": "2026-10-11 12:49",
-      "sha256": "391f4d574e8ea7ddba3983570401ae9a292435c0d12a8a659fe78f776309dfe7",
-      "size": 98644,
+      "description": "文档与表格查看（DOCX / XLSX / CSV / EPUB）。",
+      "type": "hybrid",
+      "file": "document/document-1.4.0.zip",
+      "updatedAt": "2026-10-11 15:04",
+      "sha256": "27594cca2ba398b326dde0d35d0092385b5b7f9a97ca8bbd94116a60bfe18117",
+      "size": 1850250,
       "minHostVersion": 1,
       "capabilities": {
         "extensions": [
+          "docx",
+          "xlsx",
+          "csv",
           "epub"
         ],
         "readOnly": false
