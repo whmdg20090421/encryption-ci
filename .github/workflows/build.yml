@@ -41,72 +41,64 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      contents: read
     outputs:
       plugins_changed: ${{ steps.check.outputs.plugins_changed }}
       apk_changed: ${{ steps.check.outputs.apk_changed }}
       dexdirs: ${{ steps.check.outputs.dexdirs }}
       dirs: ${{ steps.check.outputs.dirs }}
+      apk_hash: ${{ steps.check.outputs.apk_hash }}
     steps:
       - name: Checkout source (private)
         uses: actions/checkout@v4
         with:
           repository: whmdg20090421/encryption
           ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Detect changes (baseline = last successful build)
+      - name: Detect changes
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           FORCE="${{ inputs.build_plugins }}"
+          REPO="${{ github.repository }}"
           ALLDIRS=$(find plugins -mindepth 1 -maxdepth 1 -type d -not -name '__pycache__' 2>/dev/null || true)
-          HEAD_SHA=$(git rev-parse HEAD)
 
-          # 基线 = 本工作流最近一次「成功」运行所编译的源码提交（run-name 形如 "build <sha>"）。
-          # 用它到 HEAD 的 diff 判定变更，而不是 HEAD~1：这样若中间有多次提交未被编译，
-          # 期间对插件/主 APK 的改动都不会漏检。与触发方式无关（手动/自动一视同仁）。
-          BASE_SHA=""
-          for t in $(gh run list --repo "${{ github.repository }}" --workflow build.yml \
-                       --status success --limit 50 --json displayTitle \
-                       --jq '.[].displayTitle' 2>/dev/null || true); do
-            sha=${t#build }; sha=${sha%% *}
-            [ -n "$sha" ] || continue
-            [ "$sha" = "$HEAD_SHA" ] && continue
-            if git cat-file -e "${sha}^{commit}" 2>/dev/null; then
-              BASE_SHA="$sha"
-              break
-            fi
-          done
-
-          if [ -n "$BASE_SHA" ]; then
-            echo "变更基线: $BASE_SHA -> HEAD($HEAD_SHA)"
-            CHANGED=$(git diff --name-only "$BASE_SHA" HEAD || true)
-          else
-            echo "未找到历史成功编译记录，视为全量变更"
-            CHANGED=$(git ls-files)
+          # ── 插件：源码 plugin.json 版本 vs 已发布 index.json 版本 ──
+          # 版本不同（或新插件/已删除插件）才重新打包，与触发方式无关、无历史 diff 基线。
+          PUB_INDEX='{"plugins":[]}'
+          if C=$(gh api "repos/$REPO/contents/index.json?ref=plugins" --jq '.content' 2>/dev/null); then
+            DECODED=$(printf '%s' "$C" | base64 -d 2>/dev/null || true)
+            [ -n "$DECODED" ] && PUB_INDEX="$DECODED"
           fi
 
-          # 插件目录：仅打包本次有变更的插件；build_plugins=true 时强制全量。
-          if [ "$FORCE" = "true" ]; then
-            DIRS="$ALLDIRS"
-          else
-            DIRS=$(echo "$CHANGED" | grep '^plugins/' | cut -d/ -f1-2 | sort -u || true)
-            # 打包/编译脚本变更 -> 全量
-            if echo "$CHANGED" | grep -qE '^plugins/(pack_plugin.py|build_dex.sh)'; then
-              DIRS="$ALLDIRS"
-            fi
-            # XLSX 引擎本地源码变更 -> 重编文档插件
-            if echo "$CHANGED" | grep -qE '^tools/vendor/ooxml-excel-editor/'; then
-              DIRS="$DIRS plugins/document"
-            fi
-          fi
-          # 只保留含 plugin.json 的目录
           FILTERED=""
-          for d in $DIRS; do
-            [ -f "$d/plugin.json" ] && FILTERED="$FILTERED $d"
+          for d in $ALLDIRS; do
+            [ -f "$d/plugin.json" ] || continue
+            id=$(basename "$d")
+            src_ver=$(jq -r '.version // empty' "$d/plugin.json" 2>/dev/null || true)
+            pub_ver=$(printf '%s' "$PUB_INDEX" | jq -r --arg id "$id" '.plugins[]? | select(.id==$id) | .version' 2>/dev/null | head -n1)
+            if [ "$FORCE" = "true" ]; then
+              FILTERED="$FILTERED $d"
+              echo "插件 $id: 强制全量打包"
+            elif [ -z "$pub_ver" ] || [ "$src_ver" != "$pub_ver" ]; then
+              FILTERED="$FILTERED $d"
+              echo "插件 $id: 源码 $src_ver / 已发布 ${pub_ver:-（无）} -> 重新打包"
+            fi
           done
+
+          # 已发布但源码目录已删除的插件 -> 触发索引清理（打包脚本会 prune）
+          DELETED=$(printf '%s' "$PUB_INDEX" | jq -r '.plugins[]?.id' 2>/dev/null | while read -r pid; do
+            [ -n "$pid" ] || continue
+            [ -f "plugins/$pid/plugin.json" ] || echo "$pid"
+          done || true)
+          if [ -n "$DELETED" ]; then
+            echo "检测到已删除插件: $(echo $DELETED) -> 触发全量以清理索引"
+            FILTERED="$ALLDIRS"
+          fi
+
           # 其中 dex/src 内确有源码的插件才需要编译 DEX
           DEXDIRS=""
           for d in $FILTERED; do
@@ -114,19 +106,35 @@ jobs:
               DEXDIRS="$DEXDIRS $d"
             fi
           done
+
+          # ── 主 APK：源码指纹 vs 上次成功编译记录的指纹 ──
+          # 指纹 = 除 plugins/** 与 tools/vendor/** 外，所有被跟踪文件的内容哈希。
+          # 上次成功编译后由 build 作业记录到本仓 main 分支的 .apk_source_hash。
+          APK_FILES=$(git ls-files | grep -vE '^(plugins/|tools/vendor/)' || true)
+          APK_HASH=$(printf '%s\n' "$APK_FILES" | while IFS= read -r f; do
+            [ -n "$f" ] && git hash-object "$f"
+          done | sha256sum | cut -d' ' -f1)
+          STORED_HASH=""
+          if C=$(gh api "repos/$REPO/contents/.apk_source_hash?ref=main" --jq '.content' 2>/dev/null); then
+            STORED_HASH=$(printf '%s' "$C" | base64 -d 2>/dev/null | tr -d '\n' || true)
+          fi
+
           echo "dirs=$FILTERED" >> "$GITHUB_OUTPUT"
           echo "dexdirs=$DEXDIRS" >> "$GITHUB_OUTPUT"
+          echo "apk_hash=$APK_HASH" >> "$GITHUB_OUTPUT"
           if [ -n "$FILTERED" ]; then
             echo "plugins_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "plugins_changed=false" >> "$GITHUB_OUTPUT"
           fi
-          # APK 侧是否变更：除 plugins/** 与 tools/vendor/** 之外的文件有任何改动即需重编。
-          APK_CHANGED=$(echo "$CHANGED" | grep -vE '^plugins/' | grep -vE '^tools/vendor/' | grep -vE '^$' | head -1 || true)
-          if [ -n "$APK_CHANGED" ]; then
+          echo "主 APK 源码指纹: $APK_HASH"
+          echo "上次编译指纹:   ${STORED_HASH:-（无记录）}"
+          if [ "$APK_HASH" != "$STORED_HASH" ]; then
             echo "apk_changed=true" >> "$GITHUB_OUTPUT"
+            echo "主 APK: 指纹变化 -> 重新编译"
           else
             echo "apk_changed=false" >> "$GITHUB_OUTPUT"
+            echo "主 APK: 指纹一致 -> 跳过编译"
           fi
           echo "待打包: $FILTERED"
           echo "待编译 DEX: $DEXDIRS"
@@ -287,7 +295,7 @@ jobs:
     if: needs.detect.outputs.apk_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       actions: read
 
     steps:
@@ -517,3 +525,26 @@ jobs:
           path: ${{ steps.rename.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 30
+
+      - name: Record APK source hash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          NEW_HASH="${{ needs.detect.outputs.apk_hash }}"
+          [ -n "$NEW_HASH" ] || { echo "::warning::apk_hash 为空，跳过记录"; exit 0; }
+
+          # 读取本仓 main 分支现有记录以取得 blob sha（存在则更新，不存在则新建）。
+          BLOB_SHA=$(gh api "repos/$REPO/contents/.apk_source_hash?ref=main" --jq '.sha' 2>/dev/null || true)
+          CONTENT_B64=$(printf '%s\n' "$NEW_HASH" | base64 -w0)
+          if [ -n "$BLOB_SHA" ]; then
+            gh api --method PUT "repos/$REPO/contents/.apk_source_hash" \
+              -f message="chore(ci): 记录主 APK 源码指纹 ${GITHUB_SHA:0:7}" \
+              -f content="$CONTENT_B64" -f sha="$BLOB_SHA" -f branch=main >/dev/null
+          else
+            gh api --method PUT "repos/$REPO/contents/.apk_source_hash" \
+              -f message="chore(ci): 记录主 APK 源码指纹 ${GITHUB_SHA:0:7}" \
+              -f content="$CONTENT_B64" -f branch=main >/dev/null
+          fi
+          echo "已记录主 APK 源码指纹: $NEW_HASH"
