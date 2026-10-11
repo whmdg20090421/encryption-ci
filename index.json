@@ -9,8 +9,8 @@
       "description": "文档与表格查看（DOCX / XLSX / CSV / EPUB）。",
       "type": "hybrid",
       "file": "document/document-1.4.2.zip",
-      "updatedAt": "2026-10-11 22:45",
-      "sha256": "1a0c58de61d55b0f0fef2ec538bc0d188f1014388b1f72ad24b665b643055d60",
+      "updatedAt": "2026-10-11 22:51",
+      "sha256": "b677d28be1437a7c26d4d825433afd6cc2182383150c149a31800bbf904895e6",
       "size": 1852058,
       "minHostVersion": 1,
       "capabilities": {
