@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    {
+      "id": "epub",
+      "name": "EPUB 阅读器",
+      "version": "1.0.0",
+      "author": "whmdg",
+      "description": "EPUB 电子书阅读（翻页 / 目录 / 进度）。",
+      "type": "web",
+      "file": "epub/epub-1.0.0.zip",
+      "updatedAt": "2026-10-11 12:49",
+      "sha256": "391f4d574e8ea7ddba3983570401ae9a292435c0d12a8a659fe78f776309dfe7",
+      "size": 98644,
+      "minHostVersion": 1,
+      "capabilities": {
+        "extensions": [
+          "epub"
+        ],
+        "readOnly": false
+      }
+    }
+  ]
+}
