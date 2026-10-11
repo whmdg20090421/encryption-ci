@@ -39,6 +39,8 @@ jobs:
   # ───────────────────────── 变更检测 ─────────────────────────
   detect:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     outputs:
       plugins_changed: ${{ steps.check.outputs.plugins_changed }}
       apk_changed: ${{ steps.check.outputs.apk_changed }}
@@ -52,20 +54,38 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
           fetch-depth: 0
 
-      - name: Detect plugin changes
+      - name: Detect changes (baseline = last successful build)
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           FORCE="${{ inputs.build_plugins }}"
           ALLDIRS=$(find plugins -mindepth 1 -maxdepth 1 -type d -not -name '__pycache__' 2>/dev/null || true)
+          HEAD_SHA=$(git rev-parse HEAD)
 
-          # 变更检测始终基于源码仓当前提交相对父提交的 diff，与触发方式无关
-          # （手动/自动一视同仁）。这样纯插件提交不会误触发主 APK 编译。
-          # 源码仓已 checkout 到当前工作树。
-          if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
-            CHANGED=$(git diff --name-only HEAD~1 HEAD || true)
+          # 基线 = 本工作流最近一次「成功」运行所编译的源码提交（run-name 形如 "build <sha>"）。
+          # 用它到 HEAD 的 diff 判定变更，而不是 HEAD~1：这样若中间有多次提交未被编译，
+          # 期间对插件/主 APK 的改动都不会漏检。与触发方式无关（手动/自动一视同仁）。
+          BASE_SHA=""
+          for t in $(gh run list --repo "${{ github.repository }}" --workflow build.yml \
+                       --status success --limit 50 --json displayTitle \
+                       --jq '.[].displayTitle' 2>/dev/null || true); do
+            sha=${t#build }; sha=${sha%% *}
+            [ -n "$sha" ] || continue
+            [ "$sha" = "$HEAD_SHA" ] && continue
+            if git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              BASE_SHA="$sha"
+              break
+            fi
+          done
+
+          if [ -n "$BASE_SHA" ]; then
+            echo "变更基线: $BASE_SHA -> HEAD($HEAD_SHA)"
+            CHANGED=$(git diff --name-only "$BASE_SHA" HEAD || true)
           else
-            CHANGED=$(git show --name-only --pretty=format: HEAD || true)
+            echo "未找到历史成功编译记录，视为全量变更"
+            CHANGED=$(git ls-files)
           fi
 
           # 插件目录：仅打包本次有变更的插件；build_plugins=true 时强制全量。
@@ -102,7 +122,6 @@ jobs:
             echo "plugins_changed=false" >> "$GITHUB_OUTPUT"
           fi
           # APK 侧是否变更：除 plugins/** 与 tools/vendor/** 之外的文件有任何改动即需重编。
-          # 与触发方式无关，始终按 diff 判定。
           APK_CHANGED=$(echo "$CHANGED" | grep -vE '^plugins/' | grep -vE '^tools/vendor/' | grep -vE '^$' | head -1 || true)
           if [ -n "$APK_CHANGED" ]; then
             echo "apk_changed=true" >> "$GITHUB_OUTPUT"
