@@ -58,15 +58,20 @@ jobs:
           set -e
           FORCE="${{ inputs.build_plugins }}"
           ALLDIRS=$(find plugins -mindepth 1 -maxdepth 1 -type d -not -name '__pycache__' 2>/dev/null || true)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+
+          # 变更检测始终基于源码仓当前提交相对父提交的 diff，与触发方式无关
+          # （手动/自动一视同仁）。这样纯插件提交不会误触发主 APK 编译。
+          # 源码仓已 checkout 到当前工作树。
+          if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only HEAD~1 HEAD || true)
+          else
+            CHANGED=$(git show --name-only --pretty=format: HEAD || true)
+          fi
+
+          # 插件目录：仅打包本次有变更的插件；build_plugins=true 时强制全量。
+          if [ "$FORCE" = "true" ]; then
             DIRS="$ALLDIRS"
           else
-            # 源码仓已 checkout 到当前工作树；用其最新提交相对父提交判定变更。
-            if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
-              CHANGED=$(git diff --name-only HEAD~1 HEAD || true)
-            else
-              CHANGED=$(git show --name-only --pretty=format: HEAD || true)
-            fi
             DIRS=$(echo "$CHANGED" | grep '^plugins/' | cut -d/ -f1-2 | sort -u || true)
             # 打包/编译脚本变更 -> 全量
             if echo "$CHANGED" | grep -qE '^plugins/(pack_plugin.py|build_dex.sh)'; then
@@ -96,17 +101,13 @@ jobs:
           else
             echo "plugins_changed=false" >> "$GITHUB_OUTPUT"
           fi
-          # APK 侧是否变更：除 plugins/** 之外的文件有任何改动即需重编 APK。
-          # 手动触发时始终编译。
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # APK 侧是否变更：除 plugins/** 与 tools/vendor/** 之外的文件有任何改动即需重编。
+          # 与触发方式无关，始终按 diff 判定。
+          APK_CHANGED=$(echo "$CHANGED" | grep -vE '^plugins/' | grep -vE '^tools/vendor/' | grep -vE '^$' | head -1 || true)
+          if [ -n "$APK_CHANGED" ]; then
             echo "apk_changed=true" >> "$GITHUB_OUTPUT"
           else
-            APK_CHANGED=$(echo "$CHANGED" | grep -vE '^plugins/' | grep -vE '^tools/vendor/' | grep -vE '^$' | head -1 || true)
-            if [ -n "$APK_CHANGED" ]; then
-              echo "apk_changed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "apk_changed=false" >> "$GITHUB_OUTPUT"
-            fi
+            echo "apk_changed=false" >> "$GITHUB_OUTPUT"
           fi
           echo "待打包: $FILTERED"
           echo "待编译 DEX: $DEXDIRS"
