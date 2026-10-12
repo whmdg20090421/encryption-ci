@@ -4,14 +4,14 @@
     {
       "id": "document",
       "name": "文档",
-      "version": "1.4.4",
+      "version": "1.4.5",
       "author": "whmdg",
       "description": "文档与表格查看（DOCX / XLSX / CSV / EPUB）。",
       "type": "hybrid",
-      "file": "document/document-1.4.4.zip",
-      "updatedAt": "2026-10-12 00:23",
-      "sha256": "df9fdb1745157bb76f83a6baf6fb86fc9ff970761bb9cf1bb4616cefeabccbbd",
-      "size": 1853043,
+      "file": "document/document-1.4.5.zip",
+      "updatedAt": "2026-10-12 00:39",
+      "sha256": "f35dc3a905dfefd389185f09d2ada3897bdbe5bbcf7407305a18e429cf009dbc",
+      "size": 1852635,
       "minHostVersion": 1,
       "capabilities": {
         "extensions": [
